@@ -5,10 +5,10 @@ minify = true
 
 [vars]
 PROXY_LIST_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt"
-SLAVE_ENDPOINTS = "https://support-1.example.workers.dev,https://support-2.example.workers.dev"
+SLAVE_ENDPOINTS = "https://api-support.kaiakun52.workers.dev/"
 SLAVE_TOKEN = "slave"
 MASTER_TOKEN = "master"
-BATCH_SIZE = "50"
+BATCH_SIZE = "23"
 HEALTH_CHECK_TIMEOUT = "5000"
 FORCE_TOKEN = "apii"
 
