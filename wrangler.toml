@@ -11,6 +11,7 @@ name = "api-master"
 
 [env.master.vars]
 ROLE = "MASTER"
+MASTER_ENDPOINT = "https://api-master.dongtelo75.workers.dev"
 PROXY_LIST_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt"
 SLAVE_ENDPOINTS = "https://api-support.kaiakun52.workers.dev/"
 SLAVE_TOKEN = "slave"

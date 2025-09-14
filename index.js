@@ -16,6 +16,8 @@
  * - (Internally, it checks proxies and posts results back to the master's /submit-results)
  */
 
+const DISPATCH_CHUNK_SIZE = 40; // Batches to dispatch per invocation, well under 50 subrequest limit
+
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
@@ -67,7 +69,17 @@ async function handleMasterRequest(request, env, ctx) {
   if (request.method === 'POST' && path === '/force-health') {
     const auth = request.headers.get('authorization') || '';
     if (env.FORCE_TOKEN && auth !== `Bearer ${env.FORCE_TOKEN}`) return textResponse('Unauthorized', 401);
-    return await triggerHealthCheck(env);
+    return await triggerHealthCheck(env, ctx);
+  }
+
+  // POST /dispatch-internal -> internal endpoint for chained dispatch
+  if (request.method === 'POST' && path === '/dispatch-internal') {
+    // Use the same token as slaves to authenticate master-to-master calls
+    const auth = request.headers.get('authorization') || '';
+    if (!env.SLAVE_TOKEN || auth !== `Bearer ${env.SLAVE_TOKEN}`) return textResponse('Unauthorized', 401);
+    // We run this in the background, no need to await it
+    ctx.waitUntil(handleInternalDispatch(request, env, ctx));
+    return jsonResponse({ ok: true, message: 'Internal dispatch accepted.' });
   }
 
   // POST /submit-results -> slave posts results back
@@ -109,7 +121,7 @@ async function handleMasterRequest(request, env, ctx) {
     if (url.searchParams.get('FORCE_TOKEN')) {
       if (env.FORCE_TOKEN && url.searchParams.get('FORCE_TOKEN') === env.FORCE_TOKEN) {
         // Run the health check in the background and return a message
-        ctx.waitUntil(triggerHealthCheck(env));
+        ctx.waitUntil(triggerHealthCheck(env, ctx));
         return jsonResponse({ ok: true, message: 'Health check process triggered in the background.' });
       } else {
         return textResponse('Unauthorized', 401);
@@ -297,7 +309,65 @@ async function handleMasterRequest(request, env, ctx) {
   return jsonResponse({ ok: true, message: 'Master is ready. POST /force-health to dispatch.' });
 }
 
-async function triggerHealthCheck(env) {
+async function handleInternalDispatch(request, env, ctx) {
+  let payload;
+  try {
+    payload = await request.json();
+  } catch (e) {
+    console.error('INTERNAL_DISPATCH_FAIL: Invalid JSON in internal dispatch.', e);
+    return; // Cannot proceed
+  }
+
+  const { remainingBatches, endpoints, originalDispatchIndex } = payload;
+
+  if (!remainingBatches || !Array.isArray(remainingBatches) || !endpoints || !Array.isArray(endpoints)) {
+    console.error('INTERNAL_DISPATCH_FAIL: Invalid payload structure.', payload);
+    return;
+  }
+
+  if (remainingBatches.length === 0) {
+    console.log('Internal dispatch chain complete. All batches processed.');
+    return;
+  }
+
+  const currentDispatchIndex = originalDispatchIndex || 0;
+  console.log(`Continuing internal dispatch. ${remainingBatches.length} batches remaining. Starting at index ${currentDispatchIndex}.`);
+
+  const batchesToDispatch = remainingBatches.slice(0, DISPATCH_CHUNK_SIZE);
+  const nextRemainingBatches = remainingBatches.slice(DISPATCH_CHUNK_SIZE);
+
+  const dispatchPromises = batchesToDispatch.map((batch, idx) => {
+    const endpointIndex = (currentDispatchIndex + idx) % endpoints.length;
+    const endpoint = endpoints[endpointIndex];
+    return dispatchToSlave(endpoint, batch, env);
+  });
+
+  await Promise.all(dispatchPromises);
+  console.log(`Dispatched chunk of ${batchesToDispatch.length} batches.`);
+
+  if (nextRemainingBatches.length > 0) {
+    const nextDispatchIndex = currentDispatchIndex + batchesToDispatch.length;
+    console.log(`Chaining internal dispatch for next ${nextRemainingBatches.length} batches, starting at index ${nextDispatchIndex}.`);
+
+    const nextRequest = new Request(`${env.MASTER_ENDPOINT}/dispatch-internal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}`,
+      },
+      body: JSON.stringify({
+        remainingBatches: nextRemainingBatches,
+        endpoints: endpoints,
+        originalDispatchIndex: nextDispatchIndex
+      }),
+    });
+    ctx.waitUntil(fetch(nextRequest));
+  } else {
+    console.log('All batches have been dispatched in the chain.');
+  }
+}
+
+async function triggerHealthCheck(env, ctx) {
   console.log('Starting forced health check...');
   if (!env.PROXY_LIST_URL) {
     console.error('TRIGGER_FAIL: PROXY_LIST_URL not configured');
@@ -333,20 +403,55 @@ async function triggerHealthCheck(env) {
     return textResponse('No SLAVE_ENDPOINTS configured', 500);
   }
 
-  // create batches and dispatch round-robin
-  const batches = [];
-  for (let i = 0; i < proxies.length; i += batchSize) batches.push(proxies.slice(i, i + batchSize));
+  // Create all batches
+  const allBatches = [];
+  for (let i = 0; i < proxies.length; i += batchSize) {
+    allBatches.push(proxies.slice(i, i + batchSize));
+  }
 
-  console.log(`Dispatching ${proxies.length} proxies in ${batches.length} batches to ${endpoints.length} support workers.`);
-  const tasks = batches.map((batch, idx) => {
-    const endpoint = endpoints[idx % endpoints.length].replace(/\/$/, '');
+  // Split batches into an initial chunk and the remainder
+  const initialBatches = allBatches.slice(0, DISPATCH_CHUNK_SIZE);
+  const remainingBatches = allBatches.slice(DISPATCH_CHUNK_SIZE);
+
+  console.log(`Dispatching initial ${initialBatches.length} of ${allBatches.length} total batches.`);
+
+  // Dispatch the initial chunk immediately
+  const initialTasks = initialBatches.map((batch, idx) => {
+    const endpoint = endpoints[idx % endpoints.length];
     return dispatchToSlave(endpoint, batch, env);
   });
-
-  const results = await Promise.all(tasks);
+  const results = await Promise.all(initialTasks);
   const assigned = results.filter(r => r.ok).length;
-  console.log(`Dispatch complete. ${assigned} of ${batches.length} batches assigned successfully.`);
-  return jsonResponse({ message: 'dispatched', totalProxies: proxies.length, batches: batches.length, endpoints: endpoints.length, assigned, results });
+
+  // If there are more batches, kick off the background chain
+  if (remainingBatches.length > 0) {
+    console.log(`Kicking off background chain for remaining ${remainingBatches.length} batches.`);
+    const nextRequest = new Request(`${env.MASTER_ENDPOINT}/dispatch-internal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}`,
+      },
+      body: JSON.stringify({
+        remainingBatches: remainingBatches,
+        endpoints: endpoints,
+        originalDispatchIndex: initialBatches.length
+      }),
+    });
+    ctx.waitUntil(fetch(nextRequest));
+  }
+
+  // Return a response about the initial dispatch immediately
+  return jsonResponse({
+    message: 'Dispatch process initiated.',
+    totalProxies: proxies.length,
+    totalBatches: allBatches.length,
+    initialBatchesDispatched: initialBatches.length,
+    remainingBatchesInBackground: remainingBatches.length,
+    endpoints: endpoints.length,
+    initialAssigned: assigned,
+    initialResults: results,
+  });
 }
 
 async function dispatchToSlave(endpoint, batch, env) {
