@@ -14,10 +14,10 @@ on:
         # Nama ini harus SAMA PERSIS dengan nama Environment yang Anda buat di Settings GitHub.
         options:
           - master-akun-A
-          - support-1
-          - support-2
-          - support-3
-          - support-4
+          - support-akun-B
+          - support-akun-C
+          - support-akun-D
+          - support-akun-E
 
 jobs:
   deploy:

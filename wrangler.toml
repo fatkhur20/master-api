@@ -31,10 +31,10 @@ id = "c53328d44e62488899debddf822e5a5c"
 
 # IMPORTANT: You must create this KV namespace first by running:
 # `wrangler kv:namespace create SUPPORT_STATS`
-# Then, copy the 'id' into the two 'id' fields below.
+# Then, copy the 'id' from the command's output into the 'id' field below.
 [[env.master.kv_namespaces]]
 binding = "SUPPORT_STATS"
-id = "b08d2c10eb4c411595a71532565ea48c"
+id = "REPLACE_WITH_YOUR_SUPPORT_STATS_KV_ID"
 
 
 # ===================================
@@ -46,21 +46,15 @@ name = "api-support"
 [env.support.vars]
 ROLE = "SUPPORT"
 # The master's URL, so the support worker knows where to send results.
-MASTER_ENDPOINT = "https://api-master.dongtelo75.workers.dev/"
-MASTER_TOKEN = "master" # Used to authenticate back to the master
+MASTER_ENDPOINT = "https://api-master.kaiakun52.workers.dev"
+SLAVE_TOKEN = "slave" # To authenticate requests from the master (e.g., /check-batch, /lookup-geoip)
+MASTER_TOKEN = "master" # To authenticate requests to the master (e.g., /submit-results)
 HEALTH_CHECK_TIMEOUT = "5000"
 
-# For an "external" worker (different CF account), you would remove the SUPPORT_STATS binding
-# and use the STATS_REPORTING_ENDPOINT variable instead.
-# For an "internal" worker, you keep the binding and remove the endpoint variable.
-STATS_REPORTING_ENDPOINT = "https://api-master.dongtelo75.workers.dev/report-stats"
+# All support workers report their stats back to the master via this API endpoint.
+STATS_REPORTING_ENDPOINT = "https://api-master.kaiakun52.workers.dev/report-stats"
+# This token must match the EXTERNAL_STATS_TOKEN on the master worker.
 EXTERNAL_STATS_TOKEN = "external-support-secret"
 
-# The support worker also needs access to GEO_CACHE to avoid redundant lookups
-[[env.support.kv_namespaces]]
-binding = "GEO_CACHE"
-id = "c53328d44e62488899debddf822e5a5c"
-
-[[env.support.kv_namespaces]]
-binding = "SUPPORT_STATS"
-id = "b08d2c10eb4c411595a71532565ea48c" # Use the same ID as for the master
+# An external support worker does not need any direct KV bindings.
+# It communicates with the master exclusively through APIs for all stateful operations.

@@ -231,6 +231,59 @@ async function handleMasterRequest(request, env, ctx) {
     return jsonResponse({ ok: true, message: `Stats received and updated for ${key}`});
   }
 
+  // POST /lookup-geoip -> support workers ask master for geoip data
+  if (request.method === 'POST' && path === '/lookup-geoip') {
+    const auth = request.headers.get('authorization') || '';
+    // Re-use SLAVE_TOKEN for this internal M2M communication
+    if (!env.SLAVE_TOKEN || auth !== `Bearer ${env.SLAVE_TOKEN}`) {
+      return textResponse('Unauthorized', 401);
+    }
+    if (!env.GEO_CACHE) {
+      return textResponse('GEO_CACHE KV namespace not configured on master', 501);
+    }
+
+    let payload;
+    try { payload = await request.json(); } catch(e) { return textResponse('Invalid JSON', 400); }
+    if (!payload || !Array.isArray(payload.proxies)) return textResponse('Bad payload', 400);
+
+    const proxiesToLookup = payload.proxies;
+    const results = {};
+
+    // First, check cache for existing entries
+    const cachedResults = await Promise.all(proxiesToLookup.map(p => env.GEO_CACHE.get(p, 'json')));
+
+    const proxiesStillNeedingLookup = [];
+    cachedResults.forEach((cached, i) => {
+      if (cached) {
+        results[proxiesToLookup[i]] = cached;
+      } else {
+        proxiesStillNeedingLookup.push(proxiesToLookup[i]);
+      }
+    });
+
+    // For proxies not in cache, perform simulated lookup
+    if (proxiesStillNeedingLookup.length > 0) {
+      const newLookups = {};
+      const putPromises = [];
+      for (const proxy of proxiesStillNeedingLookup) {
+        // --- SIMULATED GEOIP LOOKUP ---
+        const geoData = {
+          country: 'SIM', // Simulated Country
+          isp: 'Simulated ISP',
+        };
+        // --- END SIMULATION ---
+
+        newLookups[proxy] = geoData;
+        results[proxy] = geoData;
+        putPromises.push(env.GEO_CACHE.put(proxy, JSON.stringify(geoData)));
+      }
+      // Store new results in cache without waiting for it to complete
+      ctx.waitUntil(Promise.all(putPromises));
+    }
+
+    return jsonResponse(results);
+  }
+
   // GET /stats -> view status of support workers
   if (request.method === 'GET' && path === '/stats') {
     if (!env.SUPPORT_STATS) {
@@ -408,8 +461,37 @@ async function handleSupportRequest(request, env, ctx) {
       return textResponse('Bad payload', 400);
     }
 
-    // 3. Perform health checks in parallel (simulated)
-    const results = await Promise.all(payload.batch.map(p => checkProxy(p, env)));
+    // 3. Enrich proxies with GeoIP data from the master
+    let enrichedBatch = payload.batch; // Start with the original batch
+    const proxiesToLookup = payload.batch.filter(p => p && p.ip && !p.country);
+
+    if (proxiesToLookup.length > 0) {
+      try {
+        const geoResponse = await fetch(`${env.MASTER_ENDPOINT.replace(/\/$/,'')}/lookup-geoip`, {
+          method: 'POST',
+          headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}` },
+          body: JSON.stringify({ proxies: proxiesToLookup.map(p => `${p.ip}:${p.port}`) })
+        });
+
+        if (geoResponse.ok) {
+          const geoResults = await geoResponse.json();
+          // Create a new, enriched batch instead of mutating in place
+          enrichedBatch = payload.batch.map(p => {
+            const key = `${p.ip}:${p.port}`;
+            if (geoResults[key]) {
+              // Return a new object with the original proxy data plus the new geo data
+              return { ...p, ...geoResults[key] };
+            }
+            return p; // Return the original object if no new data
+          });
+        }
+      } catch (e) {
+        console.error('Failed to fetch GeoIP data from master:', e);
+      }
+    }
+
+    // 4. Perform health checks on the (potentially) enriched batch
+    const results = await Promise.all(enrichedBatch.map(p => checkProxy(p, env)));
 
     // 4. Post results back to master asynchronously
     ctx.waitUntil(postResultsToMaster(results, env));
@@ -436,7 +518,7 @@ async function checkProxy(proxy, env) {
   const isAlive = Math.random() > 0.3; // 70% chance of being alive
   const latency = Math.floor(Math.random() * (1500 - 50 + 1)) + 50; // Random latency 50-1500ms
 
-  // TODO: GeoIP lookup logic would go here, using GEO_CACHE
+  // GeoIP lookup is now handled by the master before this function is called.
 
   return {
     proxy: `${ip}:${port}`,
@@ -476,55 +558,37 @@ async function postResultsToMaster(results, env) {
 }
 
 /**
- * Updates the stats for this support worker.
- * It uses one of two methods:
- * 1. API-based (for external workers): If STATS_REPORTING_ENDPOINT is configured, it sends a POST request.
- * 2. Direct KV write (for internal workers): If STATS_REPORTING_ENDPOINT is not set, it writes directly to SUPPORT_STATS KV.
+ * Updates the stats for this support worker by reporting to the master worker via API.
  */
 async function updateSupportStats(request, processedCount, env) {
   const supportUrl = new URL(request.url).origin;
 
-  // Method 1: API-based reporting for external workers
-  if (env.STATS_REPORTING_ENDPOINT) {
-    const statsPayload = {
-      support_url: supportUrl,
-      status: 'alive',
-      total_requests_increment: processedCount, // Master will handle incrementing
-      last_seen: new Date().toISOString(),
-    };
-    try {
-      const resp = await fetch(env.STATS_REPORTING_ENDPOINT, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${env.EXTERNAL_STATS_TOKEN || ''}`
-        },
-        body: JSON.stringify(statsPayload)
-      });
-      if (!resp.ok) {
-        console.error(`Failed to report stats via API. Status: ${resp.status}`, await resp.text());
-      }
-    } catch(e) {
-      console.error(`Error reporting stats via API for ${supportUrl}:`, e);
-    }
+  if (!env.STATS_REPORTING_ENDPOINT || !env.EXTERNAL_STATS_TOKEN) {
+    console.error('Support worker is not configured to report stats. Missing STATS_REPORTING_ENDPOINT or EXTERNAL_STATS_TOKEN.');
+    return;
   }
-  // Method 2: Direct KV write for internal workers
-  else if (env.SUPPORT_STATS) {
-    try {
-      const prevStats = await env.SUPPORT_STATS.get(supportUrl, 'json') || {
-        support_url: supportUrl,
-        total_requests: 0,
-      };
-      const newStats = {
-        ...prevStats,
-        status: 'alive',
-        total_requests: (prevStats.total_requests || 0) + processedCount,
-        last_seen: new Date().toISOString(),
-      };
-      await env.SUPPORT_STATS.put(supportUrl, JSON.stringify(newStats), { expirationTtl: 180 });
-    } catch(e) {
-      console.error(`Failed to update support stats directly in KV for ${supportUrl}:`, e);
+
+  const statsPayload = {
+    support_url: supportUrl,
+    status: 'alive',
+    total_requests_increment: processedCount,
+    last_seen: new Date().toISOString(),
+  };
+
+  try {
+    const resp = await fetch(env.STATS_REPORTING_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.EXTERNAL_STATS_TOKEN}`
+      },
+      body: JSON.stringify(statsPayload)
+    });
+    if (!resp.ok) {
+      console.error(`Failed to report stats via API. Status: ${resp.status}`, await resp.text());
     }
+  } catch(e) {
+    console.error(`Error reporting stats via API for ${supportUrl}:`, e);
   }
 }
 
