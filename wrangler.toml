@@ -18,6 +18,8 @@ MASTER_TOKEN = "master"
 BATCH_SIZE = "23"
 HEALTH_CHECK_TIMEOUT = "5000"
 FORCE_TOKEN = "apii"
+# A separate token for external support workers to report their stats via API
+EXTERNAL_STATS_TOKEN = "external-support-secret"
 
 [[env.master.kv_namespaces]]
 binding = "PROXY_CACHE"
@@ -47,6 +49,12 @@ ROLE = "SUPPORT"
 MASTER_ENDPOINT = "https://api-master.kaiakun52.workers.dev"
 MASTER_TOKEN = "master" # Used to authenticate back to the master
 HEALTH_CHECK_TIMEOUT = "5000"
+
+# For an "external" worker (different CF account), you would remove the SUPPORT_STATS binding
+# and use the STATS_REPORTING_ENDPOINT variable instead.
+# For an "internal" worker, you keep the binding and remove the endpoint variable.
+STATS_REPORTING_ENDPOINT = "https://api-master.kaiakun52.workers.dev/report-stats"
+EXTERNAL_STATS_TOKEN = "external-support-secret"
 
 # The support worker also needs access to GEO_CACHE to avoid redundant lookups
 [[env.support.kv_namespaces]]

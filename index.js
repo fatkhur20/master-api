@@ -192,6 +192,45 @@ async function handleMasterRequest(request, env, ctx) {
     return new Response(payload, { headers: { 'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="proxy_health_${cc}.json"`, ...CORS } });
   }
 
+  // POST /report-stats -> external workers post their stats
+  if (request.method === 'POST' && path === '/report-stats') {
+    const auth = request.headers.get('authorization') || '';
+    if (!env.EXTERNAL_STATS_TOKEN || auth !== `Bearer ${env.EXTERNAL_STATS_TOKEN}`) {
+      return textResponse('Unauthorized', 401);
+    }
+    if (!env.SUPPORT_STATS) {
+      return textResponse('SUPPORT_STATS KV namespace not configured on master', 501);
+    }
+
+    let stats;
+    try { stats = await request.json(); } catch(e) { return textResponse('Invalid JSON', 400); }
+
+    // The payload should contain its own identifier, e.g., support_url
+    if (!stats || !stats.support_url) {
+      return textResponse('Bad payload: missing support_url', 400);
+    }
+
+    // The key is the URL of the support worker
+    const key = stats.support_url;
+
+    // Perform a read-modify-write to handle increments safely
+    const prevStats = await env.SUPPORT_STATS.get(key, 'json') || {
+      support_url: key,
+      total_requests: 0,
+    };
+
+    const newStats = {
+      ...prevStats,
+      status: stats.status || 'alive',
+      total_requests: (prevStats.total_requests || 0) + (stats.total_requests_increment || 0),
+      last_seen: stats.last_seen || new Date().toISOString(),
+    };
+
+    await env.SUPPORT_STATS.put(key, JSON.stringify(newStats), { expirationTtl: 180 });
+
+    return jsonResponse({ ok: true, message: `Stats received and updated for ${key}`});
+  }
+
   // GET /stats -> view status of support workers
   if (request.method === 'GET' && path === '/stats') {
     if (!env.SUPPORT_STATS) {
@@ -437,31 +476,55 @@ async function postResultsToMaster(results, env) {
 }
 
 /**
- * Updates the stats for this support worker in the SUPPORT_STATS KV
+ * Updates the stats for this support worker.
+ * It uses one of two methods:
+ * 1. API-based (for external workers): If STATS_REPORTING_ENDPOINT is configured, it sends a POST request.
+ * 2. Direct KV write (for internal workers): If STATS_REPORTING_ENDPOINT is not set, it writes directly to SUPPORT_STATS KV.
  */
 async function updateSupportStats(request, processedCount, env) {
-  if (!env.SUPPORT_STATS) return; // Silently fail if not configured
-
-  // The key will be the worker's own URL, to uniquely identify it.
   const supportUrl = new URL(request.url).origin;
 
-  try {
-    const prevStats = await env.SUPPORT_STATS.get(supportUrl, 'json') || {
+  // Method 1: API-based reporting for external workers
+  if (env.STATS_REPORTING_ENDPOINT) {
+    const statsPayload = {
       support_url: supportUrl,
-      total_requests: 0,
-    };
-
-    const newStats = {
-      ...prevStats,
       status: 'alive',
-      total_requests: (prevStats.total_requests || 0) + processedCount,
+      total_requests_increment: processedCount, // Master will handle incrementing
       last_seen: new Date().toISOString(),
     };
-
-    // The TTL of 3 minutes means if a worker is offline for >3 mins, its status will expire.
-    await env.SUPPORT_STATS.put(supportUrl, JSON.stringify(newStats), { expirationTtl: 180 });
-  } catch(e) {
-    console.error(`Failed to update support stats for ${supportUrl}:`, e);
+    try {
+      const resp = await fetch(env.STATS_REPORTING_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${env.EXTERNAL_STATS_TOKEN || ''}`
+        },
+        body: JSON.stringify(statsPayload)
+      });
+      if (!resp.ok) {
+        console.error(`Failed to report stats via API. Status: ${resp.status}`, await resp.text());
+      }
+    } catch(e) {
+      console.error(`Error reporting stats via API for ${supportUrl}:`, e);
+    }
+  }
+  // Method 2: Direct KV write for internal workers
+  else if (env.SUPPORT_STATS) {
+    try {
+      const prevStats = await env.SUPPORT_STATS.get(supportUrl, 'json') || {
+        support_url: supportUrl,
+        total_requests: 0,
+      };
+      const newStats = {
+        ...prevStats,
+        status: 'alive',
+        total_requests: (prevStats.total_requests || 0) + processedCount,
+        last_seen: new Date().toISOString(),
+      };
+      await env.SUPPORT_STATS.put(supportUrl, JSON.stringify(newStats), { expirationTtl: 180 });
+    } catch(e) {
+      console.error(`Failed to update support stats directly in KV for ${supportUrl}:`, e);
+    }
   }
 }
 
