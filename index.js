@@ -85,20 +85,29 @@ export default {
         try { payload = await request.json(); } catch(e){ return textResponse('Invalid JSON',400); }
         if (!payload || !Array.isArray(payload.results)) return textResponse('Bad payload', 400);
 
-        let stored = 0;
-        for (const rec of payload.results) {
-          if (!rec || !rec.proxy) continue;
-          const key = rec.proxy;
-          try {
-            const prevRaw = await env.PROXY_CACHE.get(key);
-            await env.PROXY_CACHE.put(key, JSON.stringify(rec));
-            try { await updateSummaryIncremental(env, prevRaw ? JSON.parse(prevRaw) : null, rec); } catch(e){}
-            stored++;
-          } catch(e){
-            console.warn('KV put failed', e);
-          }
+        const validResults = payload.results.filter(r => r && r.proxy);
+        const keys = validResults.map(r => r.proxy);
+
+        // Fetch previous records in parallel
+        const prevValuesRaw = await Promise.all(keys.map(key => env.PROXY_CACHE.get(key)));
+        const prevValues = prevValuesRaw.map(v => {
+          try { return v ? JSON.parse(v) : null; } catch(e) { console.warn('failed to parse prevValue',v); return null; }
+        });
+
+        // Store new records in parallel
+        const putPromises = validResults.map((rec, i) => {
+          return env.PROXY_CACHE.put(keys[i], JSON.stringify(rec)).catch(e => console.error('KV put failed:', e));
+        });
+        await Promise.all(putPromises);
+
+        // Update summary in a single batch operation
+        try {
+          await updateSummaryBatch(env, prevValues, validResults);
+        } catch(e) {
+          console.error('Failed to update summary:', e);
         }
-        return jsonResponse({ ok:true, stored });
+
+        return jsonResponse({ ok:true, stored: validResults.length });
       }
 
       // GET /health -> summary
@@ -126,7 +135,11 @@ export default {
             if (k.name.startsWith('_')) continue;
             const v = await env.PROXY_CACHE.get(k.name);
             if (v) {
-              try { out.push(JSON.parse(v)); } catch(e){}
+              try {
+                out.push(JSON.parse(v));
+              } catch(e) {
+                console.warn(`Failed to parse KV value for key ${k.name}:`, e);
+              }
             }
           }
         } while (cursor);
@@ -183,29 +196,78 @@ async function dispatchToSlave(endpoint, batch, env) {
   }
 }
 
-/* best-effort summary update */
-async function updateSummaryIncremental(env, prev, curr) {
-  let raw = null;
-  try { raw = await env.PROXY_CACHE.get('_HEALTH_SUMMARY'); } catch(e){ raw = null; }
-  let summary = raw ? JSON.parse(raw) : { total:0, alive:0, dead:0, countries:{} };
+/* Batched summary update to reduce race conditions */
+async function updateSummaryBatch(env, prevResults, currResults) {
+  if (currResults.length === 0) return;
 
-  const remove = (o) => {
-    if (!o || !o.country) return;
-    const cc = o.country.toUpperCase();
-    summary.countries[cc] = summary.countries[cc] || { alive:0, dead:0 };
-    if (o.status === 'alive') summary.countries[cc].alive = Math.max(0,(summary.countries[cc].alive||0)-1); else summary.countries[cc].dead = Math.max(0,(summary.countries[cc].dead||0)-1);
-    if (o.status === 'alive') summary.alive = Math.max(0,(summary.alive||0)-1); else summary.dead = Math.max(0,(summary.dead||0)-1);
-  };
-  const add = (o) => {
-    if (!o || !o.country) return;
-    const cc = o.country.toUpperCase();
-    summary.countries[cc] = summary.countries[cc] || { alive:0, dead:0 };
-    if (o.status === 'alive') summary.countries[cc].alive = (summary.countries[cc].alive||0)+1; else summary.countries[cc].dead = (summary.countries[cc].dead||0)+1;
-    if (o.status === 'alive') summary.alive = (summary.alive||0)+1; else summary.dead = (summary.dead||0)+1;
+  // Note: This is still a read-modify-write operation which has a small chance of a race condition
+  // if two /submit-results requests arrive at the exact same time. However, by batching the changes,
+  // we reduce the number of RMW cycles from N to 1 per request, making a collision much less likely.
+  // A proper transactional update would require Durable Objects.
+  let summary;
+  try {
+    summary = await env.PROXY_CACHE.get('_HEALTH_SUMMARY', 'json');
+  } catch(e) {
+    console.warn('Could not parse _HEALTH_SUMMARY, rebuilding from scratch.', e);
+  }
+  if (!summary) summary = { total: 0, alive: 0, dead: 0, countries: {} };
+
+  const changes = {
+    alive: 0,
+    dead: 0,
+    countries: {} // { 'US': { alive: 5, dead: -2 } }
   };
 
-  if (prev) remove(prev);
-  add(curr);
-  summary.total = summary.total || 0;
-  try { await env.PROXY_CACHE.put('_HEALTH_SUMMARY', JSON.stringify(summary)); } catch(e){ console.warn('summary put failed', e); }
+  // Calculate net changes from previous results
+  for (const prev of prevResults) {
+    if (!prev || !prev.country) continue;
+    const cc = prev.country.toUpperCase();
+    changes.countries[cc] = changes.countries[cc] || { alive: 0, dead: 0 };
+    if (prev.status === 'alive') {
+      changes.alive--;
+      changes.countries[cc].alive--;
+    } else {
+      changes.dead--;
+      changes.countries[cc].dead--;
+    }
+  }
+
+  // Calculate net changes from new results
+  for (const curr of currResults) {
+    if (!curr || !curr.country) continue;
+    const cc = curr.country.toUpperCase();
+    changes.countries[cc] = changes.countries[cc] || { alive: 0, dead: 0 };
+    if (curr.status === 'alive') {
+      changes.alive++;
+      changes.countries[cc].alive++;
+    } else {
+      changes.dead++;
+      changes.countries[cc].dead++;
+    }
+  }
+
+  // Apply net changes to the summary
+  summary.alive = (summary.alive || 0) + changes.alive;
+  summary.dead = (summary.dead || 0) + changes.dead;
+  summary.total = summary.alive + summary.dead;
+
+  for (const [cc, c_changes] of Object.entries(changes.countries)) {
+    summary.countries[cc] = summary.countries[cc] || { alive: 0, dead: 0 };
+    summary.countries[cc].alive = (summary.countries[cc].alive || 0) + c_changes.alive;
+    summary.countries[cc].dead = (summary.countries[cc].dead || 0) + c_changes.dead;
+  }
+
+  // Ensure no negative counts
+  summary.alive = Math.max(0, summary.alive);
+  summary.dead = Math.max(0, summary.dead);
+  Object.values(summary.countries).forEach(c => {
+    c.alive = Math.max(0, c.alive);
+    c.dead = Math.max(0, c.dead);
+  });
+
+  try {
+    await env.PROXY_CACHE.put('_HEALTH_SUMMARY', JSON.stringify(summary));
+  } catch(e) {
+    console.error('Failed to PUT updated summary', e);
+  }
 }
