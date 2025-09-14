@@ -1,0 +1,60 @@
+name: Deploy Worker (Scalable Multi-Account)
+
+on:
+  # Memungkinkan workflow dipicu secara manual dari tab Actions di GitHub
+  workflow_dispatch:
+    inputs:
+      # Dropdown menu ini akan berisi nama environment yang Anda buat di Settings GitHub
+      target_environment:
+        description: 'Pilih Akun & Worker Tujuan'
+        required: true
+        type: choice
+        # --- TANDA & INSTRUKSI 1 ---
+        # Ganti atau tambahkan nama environment Anda di bawah ini.
+        # Nama ini harus SAMA PERSIS dengan nama Environment yang Anda buat di Settings GitHub.
+        options:
+          - master-akun-A
+          - support-akun-B
+          - support-akun-C
+          - support-akun-D
+          - support-akun-E
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy to ${{ github.event.inputs.target_environment }}
+
+    # --- TANDA & INSTRUKSI 2 ---
+    # Bagian ini secara otomatis akan menggunakan secret dari environment yang Anda pilih di atas.
+    # Anda tidak perlu mengubah bagian ini.
+    environment: ${{ github.event.inputs.target_environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Deploy Worker
+        run: |
+          # --- TANDA & INSTRUKSI 3 ---
+          # Script ini secara otomatis menentukan apakah akan menjalankan '--env master' atau '--env support'
+          # berdasarkan nama environment yang Anda pilih (apakah namanya diawali "master" atau tidak).
+          # Anda tidak perlu mengubah bagian ini.
+          if [[ "${{ github.event.inputs.target_environment }}" == "master"* ]]; then
+            WRANGLER_ENV="master"
+          else
+            WRANGLER_ENV="support"
+          fi
+          echo "Deploying to Cloudflare environment: $WRANGLER_ENV"
+          wrangler deploy --env $WRANGLER_ENV
+        env:
+          # Secret ini diambil dari environment yang aktif. Pastikan Anda sudah mengaturnya di Settings GitHub.
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
