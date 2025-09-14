@@ -1,19 +1,19 @@
 /**
- * proxy-health-master (Master Worker)
- * - POST /force-health     -> split proxy list and dispatch to support workers
- * - POST /submit-results   -> protected endpoint for support workers to post back results
- * - GET  /health           -> summary snapshot from KV (_HEALTH_SUMMARY)
- * - GET  /health/download/all
- * - GET  /health/download/country?cc=XX
+ * Combined Proxy Health Checker (Master + Support Worker)
  *
- * ENV / Bindings:
- * - PROXY_CACHE (KV)
- * - GEO_CACHE (KV) optional
- * - SLAVE_ENDPOINTS (env): comma-separated support worker URLs
- * - SLAVE_TOKEN (env): shared secret for master->slave calls
- * - MASTER_TOKEN (env): secret support uses to post back to master (/submit-results)
- * - PROXY_LIST_URL (env)
- * - BATCH_SIZE, HEALTH_CHECK_TIMEOUT, FORCE_TOKEN
+ * This single file contains the logic for both the Master and Support workers.
+ * The behavior is determined by the `ROLE` environment variable set in wrangler.toml.
+ *
+ * Master Role (`ROLE=MASTER`):
+ * - POST /force-health -> fetch proxy list and dispatch jobs to support workers
+ * - POST /submit-results -> protected endpoint for support workers to post back results
+ * - GET /health -> summary snapshot from KV (_HEALTH_SUMMARY)
+ * - GET /health/download/all -> download all results
+ * - GET /stats -> view status of support workers
+ *
+ * Support Role (`ROLE=SUPPORT`):
+ * - POST /check-batch -> receives a batch of proxies to check from the master
+ * - (Internally, it checks proxies and posts results back to the master's /submit-results)
  */
 
 const CORS = {
@@ -22,192 +22,265 @@ const CORS = {
   'Access-Control-Allow-Headers': 'Content-Type,Authorization',
 };
 
-function jsonResponse(obj, status=200) {
-  return new Response(JSON.stringify(obj, null, 2), { status, headers: { 'Content-Type': 'application/json', ...CORS } });
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS }
+  });
 }
-function textResponse(text, status=200) {
+
+function textResponse(text, status = 200) {
   return new Response(text, { status, headers: CORS });
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
+
+    // Route traffic based on the ROLE environment variable
     try {
-      const url = new URL(request.url);
-      const path = url.pathname;
-
-      // POST /force-health -> fetch proxy list and dispatch jobs to support workers
-      if (request.method === 'POST' && path === '/force-health') {
-        const auth = request.headers.get('authorization') || '';
-        if (env.FORCE_TOKEN && auth !== `Bearer ${env.FORCE_TOKEN}`) return textResponse('Unauthorized', 401);
-
-        if (!env.PROXY_LIST_URL) return textResponse('PROXY_LIST_URL not configured', 500);
-        const r = await fetch(env.PROXY_LIST_URL);
-        if (!r.ok) return textResponse('Failed to fetch proxy list', 502);
-        const text = await r.text();
-        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-        if (!lines.length) return textResponse('No proxies found', 400);
-
-        const proxies = lines.map(line => {
-          if (line.includes(',')) {
-            const p = line.split(',').map(s=>s.trim());
-            return { ip: p[0], port: p[1], country: p[2]||null, isp: p[3]||null };
-          } else if (line.includes(':')) {
-            const [ip, port] = line.split(':').map(s=>s.trim());
-            return { ip, port };
-          }
-          return null;
-        }).filter(Boolean);
-
-        const batchSize = Math.max(1, parseInt(env.BATCH_SIZE || '50', 10));
-        const endpoints = (env.SLAVE_ENDPOINTS||'').split(',').map(s=>s.trim()).filter(Boolean);
-        if (!endpoints.length) return textResponse('No SLAVE_ENDPOINTS configured', 500);
-
-        // create batches and dispatch round-robin
-        const batches = [];
-        for (let i=0;i<proxies.length;i+=batchSize) batches.push(proxies.slice(i,i+batchSize));
-
-        const tasks = batches.map((batch, idx) => {
-          const endpoint = endpoints[idx % endpoints.length].replace(/\/$/,'');
-          return dispatchToSlave(endpoint, batch, env);
-        });
-
-        const results = await Promise.all(tasks);
-        const assigned = results.filter(r=>r.ok).length;
-        return jsonResponse({ message:'dispatched', totalProxies: proxies.length, batches: batches.length, endpoints: endpoints.length, assigned, results });
+      if (env.ROLE === 'MASTER') {
+        return await handleMasterRequest(request, env, ctx);
+      } else if (env.ROLE === 'SUPPORT') {
+        return await handleSupportRequest(request, env, ctx);
+      } else {
+        console.error('FATAL: ROLE environment variable is not set. Worker does not know how to behave.');
+        return textResponse('Configuration error: ROLE not set.', 500);
       }
-
-      // POST /submit-results -> slave posts results back
-      if (request.method === 'POST' && path === '/submit-results') {
-        const auth = request.headers.get('authorization') || '';
-        if (!env.MASTER_TOKEN || auth !== `Bearer ${env.MASTER_TOKEN}`) return textResponse('Unauthorized', 401);
-        let payload;
-        try { payload = await request.json(); } catch(e){ return textResponse('Invalid JSON',400); }
-        if (!payload || !Array.isArray(payload.results)) return textResponse('Bad payload', 400);
-
-        const validResults = payload.results.filter(r => r && r.proxy);
-        const keys = validResults.map(r => r.proxy);
-
-        // Fetch previous records in parallel
-        const prevValuesRaw = await Promise.all(keys.map(key => env.PROXY_CACHE.get(key)));
-        const prevValues = prevValuesRaw.map(v => {
-          try { return v ? JSON.parse(v) : null; } catch(e) { console.warn('failed to parse prevValue',v); return null; }
-        });
-
-        // Store new records in parallel
-        const putPromises = validResults.map((rec, i) => {
-          return env.PROXY_CACHE.put(keys[i], JSON.stringify(rec)).catch(e => console.error('KV put failed:', e));
-        });
-        await Promise.all(putPromises);
-
-        // Update summary in a single batch operation
-        try {
-          await updateSummaryBatch(env, prevValues, validResults);
-        } catch(e) {
-          console.error('Failed to update summary:', e);
-        }
-
-        return jsonResponse({ ok:true, stored: validResults.length });
-      }
-
-      // GET /health -> summary
-      if (request.method === 'GET' && path === '/health') {
-        const cc = (url.searchParams.get('cc')||'').toUpperCase();
-        const raw = await env.PROXY_CACHE.get('_HEALTH_SUMMARY', 'json');
-        const summary = raw || { total:0, alive:0, dead:0, countries:{} };
-        if (cc) {
-          const cs = summary.countries && summary.countries[cc] ? summary.countries[cc] : { alive:0, dead:0 };
-          return jsonResponse({ total: summary.total, alive: summary.alive, dead: summary.dead, country: cc, country_summary: cs });
-        }
-        return jsonResponse(summary);
-      }
-
-      // GET /health/download/all
-      if (request.method === 'GET' && path === '/health/download/all') {
-        const cached = await env.PROXY_CACHE.get('_HEALTH_DUMP_ALL');
-        if (cached) return new Response(cached, { headers: { 'Content-Type':'application/json', 'Content-Disposition':'attachment; filename="proxy_health_all.json"', ...CORS }});
-        const out = [];
-        let cursor = undefined;
-        do {
-          const page = await env.PROXY_CACHE.list({ cursor, limit: 1000 });
-          cursor = page.cursor;
-          for (const k of page.keys) {
-            if (k.name.startsWith('_')) continue;
-            const v = await env.PROXY_CACHE.get(k.name);
-            if (v) {
-              try {
-                out.push(JSON.parse(v));
-              } catch(e) {
-                console.warn(`Failed to parse KV value for key ${k.name}:`, e);
-              }
-            }
-          }
-        } while (cursor);
-        const payload = JSON.stringify(out, null, 2);
-        await env.PROXY_CACHE.put('_HEALTH_DUMP_ALL', payload, { expirationTtl: 60 });
-        return new Response(payload, { headers: { 'Content-Type':'application/json', 'Content-Disposition':'attachment; filename="proxy_health_all.json"', ...CORS }});
-      }
-
-      // GET /health/download/country?cc=XX
-      if (request.method === 'GET' && path === '/health/download/country') {
-        const cc = (url.searchParams.get('cc')||'').toUpperCase();
-        if (!cc) return textResponse('missing cc',400);
-        const cacheKey = `_HEALTH_DUMP_CC_${cc}`;
-        const cached = await env.PROXY_CACHE.get(cacheKey);
-        if (cached) return new Response(cached, { headers: { 'Content-Type':'application/json', 'Content-Disposition': `attachment; filename="proxy_health_${cc}.json"`, ...CORS }});
-        const out = [];
-        let cursor = undefined;
-        do {
-          const page = await env.PROXY_CACHE.list({ cursor, limit: 1000 });
-          cursor = page.cursor;
-          for (const k of page.keys) {
-            if (k.name.startsWith('_')) continue;
-            const v = await env.PROXY_CACHE.get(k.name, 'json');
-            if (v && v.country && v.country.toUpperCase() === cc) out.push(v);
-          }
-        } while (cursor);
-        const payload = JSON.stringify(out, null, 2);
-        await env.PROXY_CACHE.put(cacheKey, payload, { expirationTtl: 60 });
-        return new Response(payload, { headers: { 'Content-Type':'application/json', 'Content-Disposition': `attachment; filename="proxy_health_${cc}.json"`, ...CORS }});
-      }
-
-      return jsonResponse({ ok:true, message: 'master ready. POST /force-health to dispatch.' });
     } catch (err) {
-      console.error('master error', err);
+      console.error(`Error in ${env.ROLE || 'UNKNOWN'} role:`, err);
       return textResponse(String(err), 500);
     }
   }
 };
 
+
+// ===================================================================================
+//  MASTER WORKER LOGIC
+// ===================================================================================
+
+async function handleMasterRequest(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // POST /force-health -> fetch proxy list and dispatch jobs to support workers
+  if (request.method === 'POST' && path === '/force-health') {
+    const auth = request.headers.get('authorization') || '';
+    if (env.FORCE_TOKEN && auth !== `Bearer ${env.FORCE_TOKEN}`) return textResponse('Unauthorized', 401);
+    return await triggerHealthCheck(env);
+  }
+
+  // POST /submit-results -> slave posts results back
+  if (request.method === 'POST' && path === '/submit-results') {
+    const auth = request.headers.get('authorization') || '';
+    if (!env.MASTER_TOKEN || auth !== `Bearer ${env.MASTER_TOKEN}`) return textResponse('Unauthorized', 401);
+    let payload;
+    try { payload = await request.json(); } catch (e) { return textResponse('Invalid JSON', 400); }
+    if (!payload || !Array.isArray(payload.results)) return textResponse('Bad payload', 400);
+
+    const validResults = payload.results.filter(r => r && r.proxy);
+    const keys = validResults.map(r => r.proxy);
+
+    // Fetch previous records in parallel
+    const prevValuesRaw = await Promise.all(keys.map(key => env.PROXY_CACHE.get(key)));
+    const prevValues = prevValuesRaw.map(v => {
+      try { return v ? JSON.parse(v) : null; } catch (e) { console.warn('failed to parse prevValue', v); return null; }
+    });
+
+    // Store new records in parallel
+    const putPromises = validResults.map((rec, i) => {
+      return env.PROXY_CACHE.put(keys[i], JSON.stringify(rec)).catch(e => console.error('KV put failed:', e));
+    });
+    await Promise.all(putPromises);
+
+    // Update summary in a single batch operation
+    try {
+      await updateSummaryBatch(env, prevValues, validResults);
+    } catch (e) {
+      console.error('Failed to update summary:', e);
+    }
+
+    return jsonResponse({ ok: true, stored: validResults.length });
+  }
+
+  // GET /health -> summary, with optional force trigger
+  if (request.method === 'GET' && path === '/health') {
+    // Check if a force health check is triggered via query param
+    if (url.searchParams.get('FORCE_TOKEN')) {
+      if (env.FORCE_TOKEN && url.searchParams.get('FORCE_TOKEN') === env.FORCE_TOKEN) {
+        // Run the health check in the background and return a message
+        ctx.waitUntil(triggerHealthCheck(env));
+        return jsonResponse({ ok: true, message: 'Health check process triggered in the background.' });
+      } else {
+        return textResponse('Unauthorized', 401);
+      }
+    }
+
+    const cc = (url.searchParams.get('cc') || '').toUpperCase();
+    const raw = await env.PROXY_CACHE.get('_HEALTH_SUMMARY', 'json');
+    const summary = raw || { total: 0, alive: 0, dead: 0, countries: {} };
+    if (cc) {
+      const cs = summary.countries && summary.countries[cc] ? summary.countries[cc] : { alive: 0, dead: 0 };
+      return jsonResponse({ total: summary.total, alive: summary.alive, dead: summary.dead, country: cc, country_summary: cs });
+    }
+    return jsonResponse(summary);
+  }
+
+  // GET /health/download/all?format=json|csv
+  if (request.method === 'GET' && path === '/health/download/all') {
+    const format = (url.searchParams.get('format') || 'json').toLowerCase();
+    if (format !== 'json' && format !== 'csv') {
+      return textResponse('Invalid format. Use "json" or "csv".', 400);
+    }
+    const cacheKey = `_HEALTH_DUMP_ALL_${format.toUpperCase()}`;
+    const cached = await env.PROXY_CACHE.get(cacheKey);
+    if (cached) {
+      const headers = format === 'csv'
+        ? { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="proxy_health_all.csv"', ...CORS }
+        : { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="proxy_health_all.json"', ...CORS };
+      return new Response(cached, { headers });
+    }
+
+    // Fetch all data from KV
+    const out = [];
+    let cursor = undefined;
+    do {
+      const page = await env.PROXY_CACHE.list({ cursor, limit: 1000 });
+      cursor = page.cursor;
+      for (const k of page.keys) {
+        if (k.name.startsWith('_')) continue;
+        const v = await env.PROXY_CACHE.get(k.name, 'json');
+        if (v) out.push(v);
+      }
+    } while (cursor);
+
+    let payload;
+    let headers;
+
+    if (format === 'csv') {
+      payload = convertJsonToCsv(out);
+      headers = { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="proxy_health_all.csv"', ...CORS };
+    } else {
+      payload = JSON.stringify(out, null, 2);
+      headers = { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="proxy_health_all.json"', ...CORS };
+    }
+
+    ctx.waitUntil(env.PROXY_CACHE.put(cacheKey, payload, { expirationTtl: 60 }));
+    return new Response(payload, { headers });
+  }
+
+  // GET /health/download/country?cc=XX
+  if (request.method === 'GET' && path === '/health/download/country') {
+    const cc = (url.searchParams.get('cc') || '').toUpperCase();
+    if (!cc) return textResponse('missing cc', 400);
+    const cacheKey = `_HEALTH_DUMP_CC_${cc}`;
+    const cached = await env.PROXY_CACHE.get(cacheKey);
+    if (cached) return new Response(cached, { headers: { 'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="proxy_health_${cc}.json"`, ...CORS } });
+    const out = [];
+    let cursor = undefined;
+    do {
+      const page = await env.PROXY_CACHE.list({ cursor, limit: 1000 });
+      cursor = page.cursor;
+      for (const k of page.keys) {
+        if (k.name.startsWith('_')) continue;
+        const v = await env.PROXY_CACHE.get(k.name, 'json');
+        if (v && v.country && v.country.toUpperCase() === cc) out.push(v);
+      }
+    } while (cursor);
+    const payload = JSON.stringify(out, null, 2);
+    await env.PROXY_CACHE.put(cacheKey, payload, { expirationTtl: 60 });
+    return new Response(payload, { headers: { 'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="proxy_health_${cc}.json"`, ...CORS } });
+  }
+
+  // GET /stats -> view status of support workers
+  if (request.method === 'GET' && path === '/stats') {
+    if (!env.SUPPORT_STATS) {
+      return textResponse('SUPPORT_STATS KV namespace not configured', 501);
+    }
+    const { keys } = await env.SUPPORT_STATS.list();
+    const values = await Promise.all(keys.map(k => env.SUPPORT_STATS.get(k.name, 'json')));
+    return jsonResponse(values.filter(Boolean));
+  }
+
+  return jsonResponse({ ok: true, message: 'Master is ready. POST /force-health to dispatch.' });
+}
+
+async function triggerHealthCheck(env) {
+  console.log('Starting forced health check...');
+  if (!env.PROXY_LIST_URL) {
+    console.error('TRIGGER_FAIL: PROXY_LIST_URL not configured');
+    return textResponse('PROXY_LIST_URL not configured', 500);
+  }
+  const r = await fetch(env.PROXY_LIST_URL);
+  if (!r.ok) {
+    console.error('TRIGGER_FAIL: Failed to fetch proxy list');
+    return textResponse('Failed to fetch proxy list', 502);
+  }
+  const text = await r.text();
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) {
+    console.warn('TRIGGER_WARN: No proxies found in list.');
+    return textResponse('No proxies found', 400);
+  }
+
+  const proxies = lines.map(line => {
+    if (line.includes(',')) {
+      const p = line.split(',').map(s => s.trim());
+      return { ip: p[0], port: p[1], country: p[2] || null, isp: p[3] || null };
+    } else if (line.includes(':')) {
+      const [ip, port] = line.split(':').map(s => s.trim());
+      return { ip, port };
+    }
+    return null;
+  }).filter(Boolean);
+
+  const batchSize = Math.max(1, parseInt(env.BATCH_SIZE || '50', 10));
+  const endpoints = (env.SLAVE_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!endpoints.length) {
+    console.error('TRIGGER_FAIL: No SLAVE_ENDPOINTS configured');
+    return textResponse('No SLAVE_ENDPOINTS configured', 500);
+  }
+
+  // create batches and dispatch round-robin
+  const batches = [];
+  for (let i = 0; i < proxies.length; i += batchSize) batches.push(proxies.slice(i, i + batchSize));
+
+  console.log(`Dispatching ${proxies.length} proxies in ${batches.length} batches to ${endpoints.length} support workers.`);
+  const tasks = batches.map((batch, idx) => {
+    const endpoint = endpoints[idx % endpoints.length].replace(/\/$/, '');
+    return dispatchToSlave(endpoint, batch, env);
+  });
+
+  const results = await Promise.all(tasks);
+  const assigned = results.filter(r => r.ok).length;
+  console.log(`Dispatch complete. ${assigned} of ${batches.length} batches assigned successfully.`);
+  return jsonResponse({ message: 'dispatched', totalProxies: proxies.length, batches: batches.length, endpoints: endpoints.length, assigned, results });
+}
+
 async function dispatchToSlave(endpoint, batch, env) {
   try {
-    const resp = await fetch(`${endpoint.replace(/\/$/,'')}/check-batch`, {
+    const resp = await fetch(`${endpoint.replace(/\/$/, '')}/check-batch`, {
       method: 'POST',
-      headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}` },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}` },
       body: JSON.stringify({ batch })
     });
     if (!resp.ok) {
-      return { ok:false, status:resp.status, text: await resp.text(), endpoint };
+      return { ok: false, status: resp.status, text: await resp.text(), endpoint };
     }
     const j = await resp.json();
-    return { ok:true, endpoint, result: j };
+    return { ok: true, endpoint, result: j };
   } catch (e) {
-    return { ok:false, error: String(e), endpoint };
+    return { ok: false, error: String(e), endpoint };
   }
 }
 
-/* Batched summary update to reduce race conditions */
 async function updateSummaryBatch(env, prevResults, currResults) {
   if (currResults.length === 0) return;
 
-  // Note: This is still a read-modify-write operation which has a small chance of a race condition
-  // if two /submit-results requests arrive at the exact same time. However, by batching the changes,
-  // we reduce the number of RMW cycles from N to 1 per request, making a collision much less likely.
-  // A proper transactional update would require Durable Objects.
   let summary;
   try {
     summary = await env.PROXY_CACHE.get('_HEALTH_SUMMARY', 'json');
-  } catch(e) {
+  } catch (e) {
     console.warn('Could not parse _HEALTH_SUMMARY, rebuilding from scratch.', e);
   }
   if (!summary) summary = { total: 0, alive: 0, dead: 0, countries: {} };
@@ -215,10 +288,9 @@ async function updateSummaryBatch(env, prevResults, currResults) {
   const changes = {
     alive: 0,
     dead: 0,
-    countries: {} // { 'US': { alive: 5, dead: -2 } }
+    countries: {}
   };
 
-  // Calculate net changes from previous results
   for (const prev of prevResults) {
     if (!prev || !prev.country) continue;
     const cc = prev.country.toUpperCase();
@@ -232,7 +304,6 @@ async function updateSummaryBatch(env, prevResults, currResults) {
     }
   }
 
-  // Calculate net changes from new results
   for (const curr of currResults) {
     if (!curr || !curr.country) continue;
     const cc = curr.country.toUpperCase();
@@ -246,7 +317,6 @@ async function updateSummaryBatch(env, prevResults, currResults) {
     }
   }
 
-  // Apply net changes to the summary
   summary.alive = (summary.alive || 0) + changes.alive;
   summary.dead = (summary.dead || 0) + changes.dead;
   summary.total = summary.alive + summary.dead;
@@ -257,7 +327,6 @@ async function updateSummaryBatch(env, prevResults, currResults) {
     summary.countries[cc].dead = (summary.countries[cc].dead || 0) + c_changes.dead;
   }
 
-  // Ensure no negative counts
   summary.alive = Math.max(0, summary.alive);
   summary.dead = Math.max(0, summary.dead);
   Object.values(summary.countries).forEach(c => {
@@ -267,7 +336,154 @@ async function updateSummaryBatch(env, prevResults, currResults) {
 
   try {
     await env.PROXY_CACHE.put('_HEALTH_SUMMARY', JSON.stringify(summary));
-  } catch(e) {
+  } catch (e) {
     console.error('Failed to PUT updated summary', e);
   }
+}
+
+
+// ===================================================================================
+//  SUPPORT WORKER LOGIC
+// ===================================================================================
+
+async function handleSupportRequest(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // POST /check-batch -> Master sends a batch of proxies to be checked
+  if (request.method === 'POST' && path === '/check-batch') {
+    // 1. Authenticate the request from the master
+    const auth = request.headers.get('authorization') || '';
+    if (!env.SLAVE_TOKEN || auth !== `Bearer ${env.SLAVE_TOKEN}`) {
+      return textResponse('Unauthorized', 401);
+    }
+
+    // 2. Parse the JSON payload
+    let payload;
+    try {
+      payload = await request.json();
+    } catch (e) {
+      return textResponse('Invalid JSON', 400);
+    }
+    if (!payload || !Array.isArray(payload.batch)) {
+      return textResponse('Bad payload', 400);
+    }
+
+    // 3. Perform health checks in parallel (simulated)
+    const results = await Promise.all(payload.batch.map(p => checkProxy(p, env)));
+
+    // 4. Post results back to master asynchronously
+    ctx.waitUntil(postResultsToMaster(results, env));
+
+    // 5. Update this worker's own stats in SUPPORT_STATS KV
+    ctx.waitUntil(updateSupportStats(request, payload.batch.length, env));
+
+    return jsonResponse({ ok: true, message: `Processed ${payload.batch.length} proxies. Results sent to master.` });
+  }
+
+  return textResponse('Support worker is ready. Awaiting batches.', 200);
+}
+
+/**
+ * Simulates a health check for a single proxy.
+ * In a real implementation, this would involve a TCP connection or similar.
+ */
+async function checkProxy(proxy, env) {
+  const { ip, port } = proxy;
+  const start = Date.now();
+
+  // In a real worker, you would use sockets or other APIs to check the proxy.
+  // Here, we just simulate a result.
+  const isAlive = Math.random() > 0.3; // 70% chance of being alive
+  const latency = Math.floor(Math.random() * (1500 - 50 + 1)) + 50; // Random latency 50-1500ms
+
+  // TODO: GeoIP lookup logic would go here, using GEO_CACHE
+
+  return {
+    proxy: `${ip}:${port}`,
+    status: isAlive ? 'alive' : 'dead',
+    latency: isAlive ? latency : null,
+    country: proxy.country || 'XX', // Use existing country or a default
+    isp: proxy.isp || 'Unknown ISP',
+    checked_by: 'support-worker-v1' // Example metadata
+  };
+}
+
+/**
+ * Posts the collected results back to the master worker.
+ */
+async function postResultsToMaster(results, env) {
+  if (!env.MASTER_ENDPOINT) {
+    console.error('MASTER_ENDPOINT is not configured on support worker. Cannot send results.');
+    return;
+  }
+  try {
+    const resp = await fetch(`${env.MASTER_ENDPOINT.replace(/\/$/,'')}/submit-results`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.MASTER_TOKEN || ''}`
+      },
+      body: JSON.stringify({ results })
+    });
+    if (!resp.ok) {
+      console.error(`Failed to submit results to master. Status: ${resp.status}`, await resp.text());
+    } else {
+      console.log(`Successfully submitted ${results.length} results to master.`);
+    }
+  } catch (e) {
+    console.error('Error submitting results to master:', e);
+  }
+}
+
+/**
+ * Updates the stats for this support worker in the SUPPORT_STATS KV
+ */
+async function updateSupportStats(request, processedCount, env) {
+  if (!env.SUPPORT_STATS) return; // Silently fail if not configured
+
+  // The key will be the worker's own URL, to uniquely identify it.
+  const supportUrl = new URL(request.url).origin;
+
+  try {
+    const prevStats = await env.SUPPORT_STATS.get(supportUrl, 'json') || {
+      support_url: supportUrl,
+      total_requests: 0,
+    };
+
+    const newStats = {
+      ...prevStats,
+      status: 'alive',
+      total_requests: (prevStats.total_requests || 0) + processedCount,
+      last_seen: new Date().toISOString(),
+    };
+
+    // The TTL of 3 minutes means if a worker is offline for >3 mins, its status will expire.
+    await env.SUPPORT_STATS.put(supportUrl, JSON.stringify(newStats), { expirationTtl: 180 });
+  } catch(e) {
+    console.error(`Failed to update support stats for ${supportUrl}:`, e);
+  }
+}
+
+/**
+ * Converts an array of flat JSON objects into a CSV string.
+ */
+function convertJsonToCsv(data) {
+  if (!data || data.length === 0) {
+    return "";
+  }
+
+  const headers = Object.keys(data[0]);
+  const replacer = (key, value) => value === null ? '' : value;
+
+  const csv = [
+    headers.join(','), // header row
+    ...data.map(row =>
+      headers.map(fieldName =>
+        JSON.stringify(row[fieldName], replacer)
+      ).join(',')
+    )
+  ].join('\r\n');
+
+  return csv;
 }

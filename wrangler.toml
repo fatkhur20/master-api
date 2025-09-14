@@ -1,9 +1,16 @@
-name = "api-master"
+# Common configuration for all environments
 main = "index.js"
 compatibility_date = "2024-03-26"
 minify = true
 
-[vars]
+# ==================================
+#  Environment for MASTER Worker
+# ==================================
+[env.master]
+name = "api-master"
+
+[env.master.vars]
+ROLE = "MASTER"
 PROXY_LIST_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt"
 SLAVE_ENDPOINTS = "https://api-support.kaiakun52.workers.dev/"
 SLAVE_TOKEN = "slave"
@@ -12,10 +19,40 @@ BATCH_SIZE = "23"
 HEALTH_CHECK_TIMEOUT = "5000"
 FORCE_TOKEN = "apii"
 
-[[kv_namespaces]]
+[[env.master.kv_namespaces]]
 binding = "PROXY_CACHE"
 id = "22b7a7552073455492f6177889d1c384"
 
-[[kv_namespaces]]
+[[env.master.kv_namespaces]]
 binding = "GEO_CACHE"
 id = "c53328d44e62488899debddf822e5a5c"
+
+# IMPORTANT: You must create this KV namespace first by running:
+# `wrangler kv:namespace create SUPPORT_STATS`
+# Then, copy the 'id' into the two 'id' fields below.
+[[env.master.kv_namespaces]]
+binding = "SUPPORT_STATS"
+id = "REPLACE_WITH_YOUR_SUPPORT_STATS_KV_ID"
+
+
+# ===================================
+#  Environment for SUPPORT Worker
+# ===================================
+[env.support]
+name = "api-support"
+
+[env.support.vars]
+ROLE = "SUPPORT"
+# The master's URL, so the support worker knows where to send results.
+MASTER_ENDPOINT = "https://api-master.kaiakun52.workers.dev"
+MASTER_TOKEN = "master" # Used to authenticate back to the master
+HEALTH_CHECK_TIMEOUT = "5000"
+
+# The support worker also needs access to GEO_CACHE to avoid redundant lookups
+[[env.support.kv_namespaces]]
+binding = "GEO_CACHE"
+id = "c53328d44e62488899debddf822e5a5c"
+
+[[env.support.kv_namespaces]]
+binding = "SUPPORT_STATS"
+id = "REPLACE_WITH_YOUR_SUPPORT_STATS_KV_ID" # Use the same ID as for the master
