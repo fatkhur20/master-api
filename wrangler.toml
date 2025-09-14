@@ -1,4 +1,4 @@
-# Common configuration for all environments
+name = "api-master"# Common configuration for all environments
 main = "index.js"
 compatibility_date = "2024-03-26"
 minify = true
