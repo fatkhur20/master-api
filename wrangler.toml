@@ -34,7 +34,7 @@ id = "c53328d44e62488899debddf822e5a5c"
 # Then, copy the 'id' from the command's output into the 'id' field below.
 [[env.master.kv_namespaces]]
 binding = "SUPPORT_STATS"
-id = "REPLACE_WITH_YOUR_SUPPORT_STATS_KV_ID"
+id = "b08d2c10eb4c411595a71532565ea48c"
 
 
 # ===================================
@@ -46,13 +46,13 @@ name = "api-support"
 [env.support.vars]
 ROLE = "SUPPORT"
 # The master's URL, so the support worker knows where to send results.
-MASTER_ENDPOINT = "https://api-master.kaiakun52.workers.dev"
+MASTER_ENDPOINT = "https://api-master.dongtelo75.workers.dev"
 SLAVE_TOKEN = "slave" # To authenticate requests from the master (e.g., /check-batch, /lookup-geoip)
 MASTER_TOKEN = "master" # To authenticate requests to the master (e.g., /submit-results)
 HEALTH_CHECK_TIMEOUT = "5000"
 
 # All support workers report their stats back to the master via this API endpoint.
-STATS_REPORTING_ENDPOINT = "https://api-master.kaiakun52.workers.dev/report-stats"
+STATS_REPORTING_ENDPOINT = "https://api-master.dongtelo75.workers.dev/report-stats"
 # This token must match the EXTERNAL_STATS_TOKEN on the master worker.
 EXTERNAL_STATS_TOKEN = "external-support-secret"
 
