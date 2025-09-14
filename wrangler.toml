@@ -46,14 +46,14 @@ name = "api-support"
 [env.support.vars]
 ROLE = "SUPPORT"
 # The master's URL, so the support worker knows where to send results.
-MASTER_ENDPOINT = "https://api-master.kaiakun52.workers.dev"
+MASTER_ENDPOINT = "https://api-master.dongtelo75.workers.dev/"
 MASTER_TOKEN = "master" # Used to authenticate back to the master
 HEALTH_CHECK_TIMEOUT = "5000"
 
 # For an "external" worker (different CF account), you would remove the SUPPORT_STATS binding
 # and use the STATS_REPORTING_ENDPOINT variable instead.
 # For an "internal" worker, you keep the binding and remove the endpoint variable.
-STATS_REPORTING_ENDPOINT = "https://api-master.kaiakun52.workers.dev/report-stats"
+STATS_REPORTING_ENDPOINT = "https://api-master.dongtelo75.workers.dev/report-stats"
 EXTERNAL_STATS_TOKEN = "external-support-secret"
 
 # The support worker also needs access to GEO_CACHE to avoid redundant lookups
