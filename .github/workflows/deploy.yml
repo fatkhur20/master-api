@@ -55,6 +55,7 @@ jobs:
           echo "Deploying to Cloudflare environment: $WRANGLER_ENV"
           wrangler deploy --env $WRANGLER_ENV
         env:
-          # Secret ini diambil dari environment yang aktif. Pastikan Anda sudah mengaturnya di Settings GitHub.
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          # Secret ini diambil dari environment yang aktif.
+          # Nama variabel CLOUDFLARE_* adalah nama baru yang direkomendasikan.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
