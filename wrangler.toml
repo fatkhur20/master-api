@@ -34,7 +34,7 @@ id = "c53328d44e62488899debddf822e5a5c"
 # Then, copy the 'id' into the two 'id' fields below.
 [[env.master.kv_namespaces]]
 binding = "SUPPORT_STATS"
-id = "REPLACE_WITH_YOUR_SUPPORT_STATS_KV_ID"
+id = "b08d2c10eb4c411595a71532565ea48c"
 
 
 # ===================================
@@ -63,4 +63,4 @@ id = "c53328d44e62488899debddf822e5a5c"
 
 [[env.support.kv_namespaces]]
 binding = "SUPPORT_STATS"
-id = "REPLACE_WITH_YOUR_SUPPORT_STATS_KV_ID" # Use the same ID as for the master
+id = "b08d2c10eb4c411595a71532565ea48c" # Use the same ID as for the master
