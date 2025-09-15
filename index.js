@@ -176,36 +176,38 @@ async function handleInternalDispatch(request, env, ctx) {
 
 async function triggerHealthCheck(env, ctx) {
     try {
-        console.log('Starting health check via triggerHealthCheck');
-        if (!env.PROXY_LIST_URL) {
-            console.error("TRIGGER_FAIL: PROXY_LIST_URL is not configured.");
+        console.log('Starting health check: Fetching job from API...');
+        if (!env.API_FETCH_URL) {
+            console.error("TRIGGER_FAIL: API_FETCH_URL is not configured.");
             return;
         }
 
-        const r = await fetch(env.PROXY_LIST_URL);
+        // Step 1: Fetch a job from the backend API
+        const r = await fetch(env.API_FETCH_URL);
         if (!r.ok) {
-            console.error(`TRIGGER_FAIL: Failed to fetch proxy list. Status: ${r.status}`);
+            console.error(`TRIGGER_FAIL: Failed to fetch job from API. Status: ${r.status}`);
             return;
         }
 
-        const text = await r.text();
-        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-        if (!lines.length) {
-            console.warn("TRIGGER_WARN: No proxies found in list.");
+        const job = await r.json();
+        // Expected job format: { job_id: "...", batch: ["ip:port", "ip:port", ...] }
+        if (!job || !job.job_id || !Array.isArray(job.batch) || job.batch.length === 0) {
+            console.log("No pending jobs or empty batch received from API.");
             return;
         }
 
-        const proxies = lines.map(line => {
-            if (line.includes(',')) {
-                const p = line.split(',').map(s => s.trim());
-                return { ip: p[0], port: p[1], country: p[2] || null, isp: p[3] || null };
-            } else if (line.includes(':')) {
+        console.log(`Received job ${job.job_id} with ${job.batch.length} proxies.`);
+
+        // Step 2: Convert the flat list of proxies into structured objects
+        const proxies = job.batch.map(line => {
+            if (line.includes(':')) {
                 const [ip, port] = line.split(':').map(s => s.trim());
                 return { ip, port };
             }
             return null;
         }).filter(Boolean);
 
+        // Step 3: Dispatch the job to support workers
         const batchSize = Math.max(1, parseInt(env.BATCH_SIZE || '50', 10));
         const endpoints = (env.SLAVE_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
         if (!endpoints.length) {
@@ -213,17 +215,18 @@ async function triggerHealthCheck(env, ctx) {
             return;
         }
 
-        const allBatches = [];
+        // Create smaller batches from the main job batch
+        const allSubBatches = [];
         for (let i = 0; i < proxies.length; i += batchSize) {
-            allBatches.push(proxies.slice(i, i + batchSize));
+            allSubBatches.push(proxies.slice(i, i + batchSize));
         }
 
-        const initialBatches = allBatches.slice(0, DISPATCH_CHUNK_SIZE);
-        const remainingBatches = allBatches.slice(DISPATCH_CHUNK_SIZE);
+        const initialBatches = allSubBatches.slice(0, DISPATCH_CHUNK_SIZE);
+        const remainingBatches = allSubBatches.slice(DISPATCH_CHUNK_SIZE);
 
         const initialTasks = initialBatches.map((batch, idx) => {
             const endpoint = endpoints[idx % endpoints.length];
-            const batchId = `${Date.now()}-${idx}`;
+            const batchId = `${job.job_id}-${idx}`; // Use job_id for more stable batch IDs
             return dispatchToSlave(endpoint, batch, batchId, endpoints, env, ctx);
         });
         await Promise.all(initialTasks);
@@ -232,7 +235,12 @@ async function triggerHealthCheck(env, ctx) {
             const nextRequest = new Request(`${env.MASTER_ENDPOINT}/dispatch-internal`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}` },
-                body: JSON.stringify({ remainingBatches, endpoints, originalDispatchIndex: initialBatches.length }),
+                body: JSON.stringify({
+                    remainingBatches,
+                    endpoints,
+                    originalDispatchIndex: initialBatches.length,
+                    job_id: job.job_id // Pass job_id for subsequent batches
+                }),
             });
             ctx.waitUntil(fetch(nextRequest));
         }
