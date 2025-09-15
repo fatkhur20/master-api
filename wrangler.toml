@@ -11,7 +11,6 @@ name = "api-master"
 
 [env.master.vars]
 ROLE = "MASTER"
-MASTER_ENDPOINT = "https://api-master.dongtelo75.workers.dev"
 API_FETCH_URL = "https://your-supabase-api.com/rest/v1/rpc/get_proxy_batch" # <-- GANTI DENGAN URL API ANDA
 SLAVE_ENDPOINTS = "https://api-support.kaiakun52.workers.dev/"
 SLAVE_TOKEN = "slave"
@@ -21,12 +20,6 @@ HEALTH_CHECK_TIMEOUT = "5000"
 FORCE_TOKEN = "apii"
 # A separate token for external support workers to report their stats via API
 EXTERNAL_STATS_TOKEN = "external-support-secret"
-
-[env.master.triggers]
-crons = [
-  "*/30 * * * *", # Run main health check every 30 minutes
-  "*/15 * * * *"  # Run failover check every 15 minutes
-]
 
 [[env.master.kv_namespaces]]
 binding = "PROXY_CACHE"
@@ -42,11 +35,6 @@ id = "c53328d44e62488899debddf822e5a5c"
 [[env.master.kv_namespaces]]
 binding = "SUPPORT_STATS"
 id = "b08d2c10eb4c411595a71532565ea48c"
-
-# This KV namespace is for tracking dispatched jobs for the failover mechanism.
-[[env.master.kv_namespaces]]
-binding = "DISPATCH_LOG"
-id = "2ec1e090b53341c29a4ba3c1accb1fea"
 
 
 # ===================================
