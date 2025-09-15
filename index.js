@@ -5,8 +5,8 @@
  * The behavior is determined by the `ROLE` environment variable set in wrangler.toml.
  *
  * Master Role (`ROLE=MASTER`):
- * - Cron `*/30 * * * *`: Triggers a full health check.
- * - Cron `*/15 * * * *`: Triggers a failover check for stale dispatches.
+ * - Cron (every 30 mins): Triggers a full health check.
+ * - Cron (every 15 mins): Triggers a failover check for stale dispatches.
  * - POST /force-health -> Manually triggers a full health check.
  * - POST /submit-results -> Protected endpoint for support workers to post back results.
  *
@@ -108,12 +108,14 @@ async function handleMasterRequest(request, env, ctx) {
   }
 
   if (request.method === 'GET' && path === '/health') {
-    const healthSummary = await env.PROXY_CACHE.get('_HEALTH_SUMMARY', 'json') || {};
-    const supportStats = await env.SUPPORT_STATS.list().then(async ({ keys }) => {
-      const values = await Promise.all(keys.map(k => env.SUPPORT_STATS.get(k.name, 'json')));
-      return values.filter(Boolean);
-    });
-    return jsonResponse({ health_summary: healthSummary, support_workers: supportStats });
+    const cc = (url.searchParams.get('cc') || '').toUpperCase();
+    const raw = await env.PROXY_CACHE.get('_HEALTH_SUMMARY', 'json');
+    const summary = raw || { total: 0, alive: 0, dead: 0, countries: {} };
+    if (cc) {
+      const cs = summary.countries && summary.countries[cc] ? summary.countries[cc] : { alive: 0, dead: 0 };
+      return jsonResponse({ total: summary.total, alive: summary.alive, dead: summary.dead, country: cc, country_summary: cs });
+    }
+    return jsonResponse(summary);
   }
 
   if (request.method === 'GET' && path === '/stats') {
