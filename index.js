@@ -52,14 +52,23 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    console.log(`Scheduled event triggered: ${controller.cron}`);
-    if (env.ROLE !== 'MASTER') return;
+    try {
+        console.log(`Scheduled event triggered: ${controller.cron}`);
+        if (env.ROLE !== 'MASTER') {
+            console.log("Scheduled event ignored: Not a master worker.");
+            return;
+        }
 
-    // Route to different handlers based on which cron string triggered the event
-    if (controller.cron === '*/30 * * * *') {
-      ctx.waitUntil(triggerHealthCheck(env, ctx));
-    } else if (controller.cron === '*/15 * * * *') {
-      ctx.waitUntil(handleFailoverCheck(env, ctx));
+        // Route to different handlers based on which cron string triggered the event
+        if (controller.cron === '*/30 * * * *') {
+            console.log("Initiating scheduled health check...");
+            ctx.waitUntil(triggerHealthCheck(env, ctx));
+        } else if (controller.cron === '*/15 * * * *') {
+            console.log("Initiating scheduled failover check...");
+            ctx.waitUntil(handleFailoverCheck(env, ctx));
+        }
+    } catch (err) {
+        console.error("Error in scheduled handler:", err);
     }
   }
 };
@@ -130,83 +139,106 @@ async function handleMasterRequest(request, env, ctx) {
 }
 
 async function handleInternalDispatch(request, env, ctx) {
-  let payload;
-  try { payload = await request.json(); } catch (e) { return; }
-  const { remainingBatches, endpoints, originalDispatchIndex } = payload;
-  if (!remainingBatches || !Array.isArray(remainingBatches) || !endpoints || !Array.isArray(endpoints)) return;
-  if (remainingBatches.length === 0) return;
+  try {
+    let payload;
+    try { payload = await request.json(); } catch (e) { return; }
+    const { remainingBatches, endpoints, originalDispatchIndex } = payload;
+    if (!remainingBatches || !Array.isArray(remainingBatches) || !endpoints || !Array.isArray(endpoints) || remainingBatches.length === 0) {
+        return;
+    }
 
-  const currentDispatchIndex = originalDispatchIndex || 0;
-  const batchesToDispatch = remainingBatches.slice(0, DISPATCH_CHUNK_SIZE);
-  const nextRemainingBatches = remainingBatches.slice(DISPATCH_CHUNK_SIZE);
+    const currentDispatchIndex = originalDispatchIndex || 0;
+    const batchesToDispatch = remainingBatches.slice(0, DISPATCH_CHUNK_SIZE);
+    const nextRemainingBatches = remainingBatches.slice(DISPATCH_CHUNK_SIZE);
 
-  const dispatchPromises = batchesToDispatch.map((batch, idx) => {
-    const globalIndex = currentDispatchIndex + idx;
-    const endpointIndex = globalIndex % endpoints.length;
-    const endpoint = endpoints[endpointIndex];
-    const batchId = `${Date.now()}-${globalIndex}`;
-    return dispatchToSlave(endpoint, batch, batchId, endpoints, env, ctx);
-  });
-  await Promise.all(dispatchPromises);
-
-  if (nextRemainingBatches.length > 0) {
-    const nextDispatchIndex = currentDispatchIndex + batchesToDispatch.length;
-    const nextRequest = new Request(`${env.MASTER_ENDPOINT}/dispatch-internal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}` },
-      body: JSON.stringify({ remainingBatches: nextRemainingBatches, endpoints, originalDispatchIndex: nextDispatchIndex }),
+    const dispatchPromises = batchesToDispatch.map((batch, idx) => {
+        const globalIndex = currentDispatchIndex + idx;
+        const endpointIndex = globalIndex % endpoints.length;
+        const endpoint = endpoints[endpointIndex];
+        const batchId = `${Date.now()}-${globalIndex}`;
+        return dispatchToSlave(endpoint, batch, batchId, endpoints, env, ctx);
     });
-    ctx.waitUntil(fetch(nextRequest));
+    await Promise.all(dispatchPromises);
+
+    if (nextRemainingBatches.length > 0) {
+        const nextDispatchIndex = currentDispatchIndex + batchesToDispatch.length;
+        const nextRequest = new Request(`${env.MASTER_ENDPOINT}/dispatch-internal`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}` },
+            body: JSON.stringify({ remainingBatches: nextRemainingBatches, endpoints, originalDispatchIndex: nextDispatchIndex }),
+        });
+        ctx.waitUntil(fetch(nextRequest));
+    }
+  } catch (err) {
+      console.error("Error in handleInternalDispatch:", err);
   }
 }
 
 async function triggerHealthCheck(env, ctx) {
-  console.log('Starting health check via triggerHealthCheck');
-  if (!env.PROXY_LIST_URL) return;
-  const r = await fetch(env.PROXY_LIST_URL);
-  if (!r.ok) return;
-  const text = await r.text();
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  if (!lines.length) return;
+    try {
+        console.log('Starting health check via triggerHealthCheck');
+        if (!env.PROXY_LIST_URL) {
+            console.error("TRIGGER_FAIL: PROXY_LIST_URL is not configured.");
+            return;
+        }
 
-  const proxies = lines.map(line => {
-    if (line.includes(',')) {
-      const p = line.split(',').map(s => s.trim());
-      return { ip: p[0], port: p[1], country: p[2] || null, isp: p[3] || null };
-    } else if (line.includes(':')) {
-      const [ip, port] = line.split(':').map(s => s.trim());
-      return { ip, port };
+        const r = await fetch(env.PROXY_LIST_URL);
+        if (!r.ok) {
+            console.error(`TRIGGER_FAIL: Failed to fetch proxy list. Status: ${r.status}`);
+            return;
+        }
+
+        const text = await r.text();
+        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+        if (!lines.length) {
+            console.warn("TRIGGER_WARN: No proxies found in list.");
+            return;
+        }
+
+        const proxies = lines.map(line => {
+            if (line.includes(',')) {
+                const p = line.split(',').map(s => s.trim());
+                return { ip: p[0], port: p[1], country: p[2] || null, isp: p[3] || null };
+            } else if (line.includes(':')) {
+                const [ip, port] = line.split(':').map(s => s.trim());
+                return { ip, port };
+            }
+            return null;
+        }).filter(Boolean);
+
+        const batchSize = Math.max(1, parseInt(env.BATCH_SIZE || '50', 10));
+        const endpoints = (env.SLAVE_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
+        if (!endpoints.length) {
+            console.error("TRIGGER_FAIL: No SLAVE_ENDPOINTS configured.");
+            return;
+        }
+
+        const allBatches = [];
+        for (let i = 0; i < proxies.length; i += batchSize) {
+            allBatches.push(proxies.slice(i, i + batchSize));
+        }
+
+        const initialBatches = allBatches.slice(0, DISPATCH_CHUNK_SIZE);
+        const remainingBatches = allBatches.slice(DISPATCH_CHUNK_SIZE);
+
+        const initialTasks = initialBatches.map((batch, idx) => {
+            const endpoint = endpoints[idx % endpoints.length];
+            const batchId = `${Date.now()}-${idx}`;
+            return dispatchToSlave(endpoint, batch, batchId, endpoints, env, ctx);
+        });
+        await Promise.all(initialTasks);
+
+        if (remainingBatches.length > 0) {
+            const nextRequest = new Request(`${env.MASTER_ENDPOINT}/dispatch-internal`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}` },
+                body: JSON.stringify({ remainingBatches, endpoints, originalDispatchIndex: initialBatches.length }),
+            });
+            ctx.waitUntil(fetch(nextRequest));
+        }
+    } catch (err) {
+        console.error("Error in triggerHealthCheck:", err);
     }
-    return null;
-  }).filter(Boolean);
-
-  const batchSize = Math.max(1, parseInt(env.BATCH_SIZE || '50', 10));
-  const endpoints = (env.SLAVE_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (!endpoints.length) return;
-
-  const allBatches = [];
-  for (let i = 0; i < proxies.length; i += batchSize) {
-    allBatches.push(proxies.slice(i, i + batchSize));
-  }
-
-  const initialBatches = allBatches.slice(0, DISPATCH_CHUNK_SIZE);
-  const remainingBatches = allBatches.slice(DISPATCH_CHUNK_SIZE);
-
-  const initialTasks = initialBatches.map((batch, idx) => {
-    const endpoint = endpoints[idx % endpoints.length];
-    const batchId = `${Date.now()}-${idx}`;
-    return dispatchToSlave(endpoint, batch, batchId, endpoints, env, ctx);
-  });
-  await Promise.all(initialTasks);
-
-  if (remainingBatches.length > 0) {
-    const nextRequest = new Request(`${env.MASTER_ENDPOINT}/dispatch-internal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${env.SLAVE_TOKEN || ''}` },
-      body: JSON.stringify({ remainingBatches, endpoints, originalDispatchIndex: initialBatches.length }),
-    });
-    ctx.waitUntil(fetch(nextRequest));
-  }
 }
 
 async function dispatchToSlave(endpoint, batch, batchId, endpoints, env, ctx) {
@@ -226,55 +258,58 @@ async function dispatchToSlave(endpoint, batch, batchId, endpoints, env, ctx) {
 }
 
 async function handleFailoverCheck(env, ctx) {
-  console.log('Running failover check for stale dispatches...');
-  if (!env.DISPATCH_LOG || !env.SUPPORT_STATS) return;
+    try {
+        console.log('Running failover check for stale dispatches...');
+        if (!env.DISPATCH_LOG || !env.SUPPORT_STATS) {
+            console.error("FAILOVER_FAIL: DISPATCH_LOG or SUPPORT_STATS KV namespace not configured.");
+            return;
+        }
 
-  const { keys: staleKeys } = await env.DISPATCH_LOG.list();
-  if (staleKeys.length === 0) {
-    console.log('No pending dispatches found. Failover check complete.');
-    return;
-  }
+        const { keys: staleKeys } = await env.DISPATCH_LOG.list();
+        if (staleKeys.length === 0) {
+            console.log('No pending dispatches found. Failover check complete.');
+            return;
+        }
 
-  const { keys: supportWorkerKeys } = await env.SUPPORT_STATS.list();
-  const supportWorkers = await Promise.all(
-    supportWorkerKeys.map(k => env.SUPPORT_STATS.get(k.name, 'json'))
-  );
-  const activeWorkers = supportWorkers.filter(w => w && w.status === 'alive').map(w => w.support_url);
+        const { keys: supportWorkerKeys } = await env.SUPPORT_STATS.list();
+        const supportWorkers = await Promise.all(
+            supportWorkerKeys.map(k => env.SUPPORT_STATS.get(k.name, 'json'))
+        );
+        const activeWorkers = supportWorkers.filter(w => w && w.status === 'alive').map(w => w.support_url);
 
-  if (activeWorkers.length === 0) {
-    console.error('FAILOVER_FAIL: No active support workers available to re-dispatch tasks.');
-    return;
-  }
+        if (activeWorkers.length === 0) {
+            console.error('FAILOVER_FAIL: No active support workers available to re-dispatch tasks.');
+            return;
+        }
 
-  let redispatchedCount = 0;
-  for (const key of staleKeys) {
-    const logEntry = await env.DISPATCH_LOG.get(key.name, 'json');
-    if (!logEntry) continue;
+        let redispatchedCount = 0;
+        for (const key of staleKeys) {
+            const logEntry = await env.DISPATCH_LOG.get(key.name, 'json');
+            if (!logEntry) continue;
 
-    if (Date.now() - logEntry.timestamp > STALE_DISPATCH_TIMEOUT) {
-      console.warn(`Found stale dispatch: ${key.name}, originally sent to ${logEntry.dispatchedTo}. Re-dispatching...`);
+            if (Date.now() - logEntry.timestamp > STALE_DISPATCH_TIMEOUT) {
+                console.warn(`Found stale dispatch: ${key.name}, originally sent to ${logEntry.dispatchedTo}. Re-dispatching...`);
 
-      const originalWorker = logEntry.dispatchedTo;
-      const availableWorkers = activeWorkers.filter(w => w !== originalWorker);
-      const targetWorker = availableWorkers.length > 0 ? availableWorkers[0] : activeWorkers[0]; // Pick a different worker if possible
+                const originalWorker = logEntry.dispatchedTo;
+                const availableWorkers = activeWorkers.filter(w => w !== originalWorker);
+                const targetWorker = availableWorkers.length > 0 ? availableWorkers[0] : activeWorkers[0];
 
-      if (!targetWorker) {
-          console.error(`FAILOVER_SKIP: Could not find a suitable active worker for stale batch ${key.name}.`);
-          continue;
-      }
+                if (!targetWorker) {
+                    console.error(`FAILOVER_SKIP: Could not find a suitable active worker for stale batch ${key.name}.`);
+                    continue;
+                }
 
-      // Re-dispatch to the new target worker
-      const newBatchId = `failover-${key.name}`;
-      // Need to pass the full list of endpoints to the re-dispatched slave
-      const allEndpoints = (env.SLAVE_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
-      await dispatchToSlave(targetWorker, logEntry.batch, newBatchId, allEndpoints, env, ctx);
-      redispatchedCount++;
-
-      // Delete the old stale log to prevent it from being re-dispatched again
-      await env.DISPATCH_LOG.delete(key.name);
+                const newBatchId = `failover-${key.name}`;
+                const allEndpoints = (env.SLAVE_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
+                await dispatchToSlave(targetWorker, logEntry.batch, newBatchId, allEndpoints, env, ctx);
+                redispatchedCount++;
+                await env.DISPATCH_LOG.delete(key.name);
+            }
+        }
+        console.log(`Failover check complete. Re-dispatched ${redispatchedCount} stale batches.`);
+    } catch(err) {
+        console.error("Error in handleFailoverCheck:", err);
     }
-  }
-  console.log(`Failover check complete. Re-dispatched ${redispatchedCount} stale batches.`);
 }
 
 async function updateSummaryBatch(env, prevResults, currResults) {
