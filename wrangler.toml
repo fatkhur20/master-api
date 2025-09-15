@@ -11,7 +11,7 @@ name = "api-master"
 
 [env.master.vars]
 ROLE = "MASTER"
-API_FETCH_URL = "https://your-supabase-api.com/rest/v1/rpc/get_proxy_batch" # <-- GANTI DENGAN URL API ANDA
+PROXY_LIST_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt"
 SLAVE_ENDPOINTS = "https://api-support.kaiakun52.workers.dev/"
 SLAVE_TOKEN = "slave"
 MASTER_TOKEN = "master"
