@@ -1,60 +1,33 @@
-name: Deploy Worker (Scalable Multi-Account)
+name: Deploy to VPS
 
 on:
-  # Memungkinkan workflow dipicu secara manual dari tab Actions di GitHub
-  workflow_dispatch:
-    inputs:
-      # Dropdown menu ini akan berisi nama environment yang Anda buat di Settings GitHub
-      target_environment:
-        description: 'Pilih Akun & Worker Tujuan'
-        required: true
-        type: choice
-        # --- TANDA & INSTRUKSI 1 ---
-        # Ganti atau tambahkan nama environment Anda di bawah ini.
-        # Nama ini harus SAMA PERSIS dengan nama Environment yang Anda buat di Settings GitHub.
-        options:
-          - master-akun-A
-          - support-akun-B
-          - support-akun-C
-          - support-akun-D
-          - support-akun-E
+  push:
+    branches:
+      - Main
+      - master
+      - feature/complete-roadmap-implementation
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    name: Deploy to ${{ github.event.inputs.target_environment }}
-
-    # --- TANDA & INSTRUKSI 2 ---
-    # Bagian ini secara otomatis akan menggunakan secret dari environment yang Anda pilih di atas.
-    # Anda tidak perlu mengubah bagian ini.
-    environment: ${{ github.event.inputs.target_environment }}
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v2
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
         with:
-          node-version: '18'
-
-      - name: Install Wrangler
-        run: npm install -g wrangler
-
-      - name: Deploy Worker
-        run: |
-          # --- TANDA & INSTRUKSI 3 ---
-          # Script ini secara otomatis menentukan apakah akan menjalankan '--env master' atau '--env support'
-          # berdasarkan nama environment yang Anda pilih (apakah namanya diawali "master" atau tidak).
-          # Anda tidak perlu mengubah bagian ini.
-          if [[ "${{ github.event.inputs.target_environment }}" == "master"* ]]; then
-            WRANGLER_ENV="master"
-          else
-            WRANGLER_ENV="support"
-          fi
-          echo "Deploying to Cloudflare environment: $WRANGLER_ENV"
-          wrangler deploy --env $WRANGLER_ENV
-        env:
-          # Secret ini diambil dari environment yang aktif. Pastikan Anda sudah mengaturnya di Settings GitHub.
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          # port: ${{ secrets.VPS_PORT }} # Optional, default is 22
+          script: |
+            cd ~/apiv2  # <-- Ganti dengan path folder Anda di VPS
+            git pull origin feature/complete-roadmap-implementation
+            
+            # Rebuild only if necessary, but forcing build ensures updates apply
+            docker compose down
+            docker compose up -d --build
+            
+            # Prune unused images to save space
+            docker image prune -f
